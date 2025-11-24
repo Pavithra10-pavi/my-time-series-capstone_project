@@ -1,0 +1,9 @@
+1 Acquire or programmatically generate a time series dataset (minimum 3 years of hourly or daily data) exhibiting at least two distinct seasonalities (e.g., weekly and yearly). Document the data generation/loading process in detail.
+
+2 Implement, tune, and validate a baseline forecasting model using only the Facebook Prophet library. Record performance metrics using expanding-window cross-validation.
+
+3 Develop a Deep Learning model (LSTM or TCN) designed to forecast the *residuals" ($Y (actual) - Y_(prophet)$) from the Prophet model. Ensure proper data preparation, sequence generation, and hyperparameter optimization for the DL component.
+
+4 Construct and evaluate the final hybrid model ($Y_(hybrid) = Y_(prophet) + Y_(residual forecast)$). Compare its prediction metrics against the Prophet baseline across multiple test horizons.
+
+5 Document all code clearly using docstrings and comments, adhering to PEP 8 standards.
