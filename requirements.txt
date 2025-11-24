@@ -1,0 +1,6 @@
+pandas
+numpy
+prophet
+optuna
+scikit-learn
+tensorflow
