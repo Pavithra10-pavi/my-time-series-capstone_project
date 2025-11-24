@@ -1,0 +1,206 @@
+# "Advanced Time Series Forecasting with Prophet and Deep Learning Hybrid Models"
+import pandas as pd
+import numpy as np
+import optuna
+import tensorflow as tf
+from prophet import Prophet
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import Adam
+
+# --- Configuration ---
+DATA_FILE = 'three_year_timeseries.csv'
+TEST_SIZE_DAYS = 90
+LSTM_SEQUENCE_LENGTH = 30
+PROPHET_OPTUNA_TRIALS = 50
+LSTM_OPTUNA_TRIALS = 20
+
+# --- 1. Data Loading and Splitting ---
+
+def load_and_split_data(filepath, test_size_days):
+    """Loads data, ensures correct type, and splits into train/test sets."""
+    print(f"Loading data from {filepath}...")
+    df = pd.read_csv(filepath)
+    df['ds'] = pd.to_datetime(df['ds'])
+    
+    # Split data
+    split_date = df['ds'].max() - pd.Timedelta(days=test_size_days)
+    train_df = df[df['ds'] <= split_date]
+    test_df = df[df['ds'] > split_date]
+    
+    print(f"Train size: {len(train_df)} rows. Test size: {len(test_df)} rows.")
+    return train_df, test_df
+
+# --- 2. Prophet Model Optimization (using Optuna) ---
+
+def objective_prophet(trial, train_df, test_df):
+    """Optuna objective function for Prophet hyperparameter tuning."""
+    # Define hyperparameter search space
+    cp_scale = trial.suggest_float('changepoint_prior_scale', 0.001, 0.1)
+    s_scale = trial.suggest_float('seasonality_prior_scale', 0.1, 10.0)
+    
+    # Fit Prophet model
+    m = Prophet(
+        changepoint_prior_scale=cp_scale,
+        seasonality_prior_scale=s_scale,
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True
+    )
+    m.fit(train_df)
+    
+    # Make forecast
+    future = m.make_future_dataframe(periods=len(test_df), include_history=False)
+    forecast = m.predict(future)
+    
+    # Calculate RMSE on the test set
+    y_true = test_df['y'].values
+    y_pred = forecast['yhat'].values
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    
+    return rmse
+
+def tune_prophet(train_df, test_df, n_trials):
+    """Runs the Optuna study to find the best Prophet model."""
+    print(f"\n--- Starting Prophet Optimization ({n_trials} trials) ---")
+    study = optuna.create_study(direction='minimize')
+    study.optimize(lambda trial: objective_prophet(trial, train_df, test_df), n_trials=n_trials, show_progress_bar=True)
+    
+    print("Best Prophet Parameters:", study.best_params)
+    
+    # Retrain final best model
+    best_params = study.best_params
+    m_best = Prophet(
+        changepoint_prior_scale=best_params['changepoint_prior_scale'],
+        seasonality_prior_scale=best_params['seasonality_prior_scale'],
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=True
+    )
+    m_best.fit(train_df)
+    
+    # Get initial forecast and residuals
+    future = m_best.make_future_dataframe(periods=len(test_df), include_history=False)
+    prophet_forecast = m_best.predict(future)
+    
+    # Calculate residuals
+    test_df = test_df.reset_index(drop=True)
+    prophet_forecast = prophet_forecast.reset_index(drop=True)
+    residuals = test_df['y'] - prophet_forecast['yhat']
+    
+    prophet_rmse = np.sqrt(mean_squared_error(test_df['y'], prophet_forecast['yhat']))
+    print(f"Prophet-only RMSE on Test Set: {prophet_rmse:.4f}")
+    
+    return m_best, prophet_forecast, residuals
+
+# --- 3. LSTM Residual Modeling ---
+
+def create_sequences(data, seq_length):
+    """Converts a flat series into sequences for LSTM training."""
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i + seq_length])
+        y.append(data[i + seq_length])
+    return np.array(X), np.array(y)
+
+def build_lstm_model(n_units, learning_rate, input_shape):
+    """Creates a basic LSTM model architecture."""
+    model = Sequential([
+        LSTM(n_units, activation='relu', input_shape=input_shape),
+        Dense(1)
+    ])
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mse')
+    return model
+
+def tune_and_train_lstm(residuals, n_trials, seq_length):
+    """Tunes and trains the LSTM model on residuals using Optuna."""
+    print(f"\n--- Starting LSTM Optimization ({n_trials} trials) ---")
+    
+    # Scale the residuals for LSTM
+    scaler = MinMaxScaler()
+    residuals_scaled = scaler.fit_transform(residuals.values.reshape(-1, 1))
+    
+    # Create sequences
+    X, y = create_sequences(residuals_scaled, seq_length)
+    
+    # Define objective for LSTM tuning
+    def objective_lstm(trial):
+        n_units = trial.suggest_int('n_units', 16, 64)
+        lr = trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+        
+        model = build_lstm_model(n_units, lr, (seq_length, 1))
+        
+        # Train and evaluate
+        model.fit(X, y, epochs=50, batch_size=batch_size, verbose=0)
+        y_pred = model.predict(X, verbose=0)
+        
+        return np.sqrt(mean_squared_error(y, y_pred))
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective_lstm, n_trials=n_trials, show_progress_bar=True)
+    
+    best_params = study.best_params
+    print("Best LSTM Parameters:", best_params)
+
+    # Retrain and predict using the best model
+    best_model = build_lstm_model(
+        best_params['n_units'], 
+        best_params['learning_rate'], 
+        (seq_length, 1)
+    )
+    best_model.fit(X, y, epochs=100, batch_size=best_params['batch_size'], verbose=0)
+    
+    # Predict residuals on the test set sequence data
+    # Note: X already represents the test set residuals (minus the first seq_length points)
+    lstm_predictions_scaled = best_model.predict(X, verbose=0)
+    
+    # Inverse transform to original residual scale
+    lstm_predictions = scaler.inverse_transform(lstm_predictions_scaled).flatten()
+    
+    return lstm_predictions, seq_length
+
+# --- 4. Final Evaluation ---
+
+def evaluate_hybrid_model(test_df, prophet_forecast, lstm_predictions, seq_length):
+    """Combines Prophet and LSTM predictions and evaluates the final result."""
+    
+    # Align the Prophet forecast with the LSTM predictions
+    # LSTM predictions start after the initial sequence_length points
+    prophet_aligned = prophet_forecast['yhat'].values[seq_length:]
+    y_true_aligned = test_df['y'].values[seq_length:]
+    
+    # Calculate Hybrid Forecast
+    hybrid_forecast = prophet_aligned + lstm_predictions
+    
+    # Calculate metrics
+    hybrid_rmse = np.sqrt(mean_squared_error(y_true_aligned, hybrid_forecast))
+    hybrid_mae = mean_absolute_error(y_true_aligned, hybrid_forecast)
+    
+    print("\n--- FINAL HYBRID MODEL PERFORMANCE ---")
+    print(f"Aligned Sample Size: {len(y_true_aligned)} points")
+    print(f"Hybrid RMSE: {hybrid_rmse:.4f}")
+    print(f"Hybrid MAE: {hybrid_mae:.4f}")
+    
+    return hybrid_forecast, hybrid_rmse, hybrid_mae
+
+# --- Main Execution ---
+
+if _name_ == '_main_':
+    # 1. Load and Split Data
+    train_df, test_df = load_and_split_data(DATA_FILE, TEST_SIZE_DAYS)
+    
+    # 2. Tune Prophet and Get Initial Residuals
+    m_best, prophet_forecast, residuals = tune_prophet(train_df, test_df, PROPHET_OPTUNA_TRIALS)
+    
+    # 3. Tune and Train LSTM on Residuals
+    lstm_predictions, seq_length = tune_and_train_lstm(residuals, LSTM_OPTUNA_TRIALS, LSTM_SEQUENCE_LENGTH)
+    
+    # 4. Evaluate Hybrid Model
+    hybrid_forecast, hybrid_rmse, hybrid_mae = evaluate_hybrid_model(
+        test_df, prophet_forecast, lstm_predictions, seq_length
+    )
+    
+    print("\nProcess Complete. Hybrid model results are printed above.")
